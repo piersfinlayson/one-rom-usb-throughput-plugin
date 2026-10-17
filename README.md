@@ -80,7 +80,7 @@ python3 throughput.py --seconds 60 --cmd "led cycle" --at "20:serve off" --at "4
 The plugin can be driven interactively using the USB serial port.  The
 supported commands are printed upon connection and by running `help`.
 
-## Frames Layout
+## Frame Layout
 
 The frame layout is in the comment at the top of `plugin_main.c`.
 
