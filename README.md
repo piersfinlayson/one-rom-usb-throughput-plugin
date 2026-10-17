@@ -1,4 +1,4 @@
-# One ROM USB Throughput Test
+# One ROM USB Throughput Plugin
 
 A One ROM user plugin that streams binary frames to the host over the USB
 plugin's CDC serial port.  Can be used to check the reliability and maximum
