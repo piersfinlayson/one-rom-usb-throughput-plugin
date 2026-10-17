@@ -1,6 +1,6 @@
 {
     "name": "usb-throughput",
-    "display_name": "One ROM USB Throughput Test",
+    "display_name": "One ROM USB Throughput",
     "description": "Tests data throughput through One ROM's system USB plugin",
     "author": "Piers Finlayson",
     "source": "https://github.com/piersfinlayson/one-rom-usb-throughput-plugin",
