@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Fetch One ROM
+      run: make one-rom
+
+    - name: Cache Arm GNU toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/arm-gnu-toolchain
+        key: arm-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/one-rom-*/ci/arm-toolchain-version') }}
+
+    - name: Install Arm GNU toolchain
+      run: echo "TOOLCHAIN=$(build/one-rom-*/ci/install-arm-toolchain.sh)" >> "$GITHUB_ENV"
+
+    - name: Build plugin
+      run: |
+        make
+        make DRIVE=2 SLEW=slow
+
+    - name: Check scripts
+      run: |
+        python3 -m py_compile throughput.py bench/lab.py
+        for f in bench/*.sh; do bash -n "$f"; done
