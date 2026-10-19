@@ -3,16 +3,18 @@
 #
 # MIT License
 
-# drive.py <label> <set>... - programs build/plugin_user.bin and
-# images/fill_00.rom, then for each set streams for 60s with the One ROM in
-# standby while Lab drives data lines with the d command.  A set is idle or
-# <mask>:<delay>, for example f8:0 for D3-D7 with no delay.  Waits for One ROM
-# to be replugged over USB when the link dies.
+# drive.py <label> <set>... - programs build/plugin_user.bin and an all-0x00
+# image, then for each set streams for 60s with the One ROM in standby while
+# Lab drives data lines with the d command.  CHIP sets the chip type, one of
+# CHIP_BYTES.  A set is idle or <mask>:<delay>, for example f8:0 for D3-D7 or
+# all:0 for every data line, with no delay.  Waits for One ROM to be replugged
+# over USB when the link dies.
 
 import os
 import re
 import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -21,11 +23,17 @@ import serial.tools.list_ports
 
 SERIAL = os.environ.get("C", "952FFC01836FBD89")
 LAB = os.environ.get("LAB", "/dev/cu.usbmodem1203")
+CHIP = os.environ.get("CHIP", "27256")
+CHIP_BYTES = {"2732": 4096, "27256": 32768, "27C010": 131072, "27C400": 524288}
 B = Path(__file__).resolve().parent
 P = B.parent
 label, sets = sys.argv[1], sys.argv[2:]
 out = B / "results" / f"drive-{label}"
 out.mkdir(parents=True, exist_ok=True)
+if CHIP not in CHIP_BYTES:
+    sys.exit(f"CHIP must be one of {', '.join(CHIP_BYTES)}")
+image = out / f"fill_00_{CHIP}.rom"
+image.write_bytes(bytes(CHIP_BYTES[CHIP]))
 summary = open(out / "summary.txt", "a")
 
 
@@ -51,7 +59,7 @@ def answers():
                 data += s.read(4096)
                 if b"status " in data:
                     return True
-    except serial.SerialException:
+    except (serial.SerialException, termios.error):
         pass
     return False
 
@@ -79,7 +87,8 @@ def run(lines):
         lab_cmd = "?"
     else:
         mask, delay = lines.split(":")
-        lab_cmd = f"d:27256:0x{mask}:{delay}"
+        mask = mask if mask == "all" else f"0x{mask}"
+        lab_cmd = f"d:{CHIP}:{mask}:{delay}"
     lab = subprocess.Popen(["python3", "-u", str(B / "lab.py"), LAB, lab_cmd, "65"],
                            stdout=open(xlog, "w"), stderr=subprocess.STDOUT)
     time.sleep(3)
@@ -102,6 +111,9 @@ def run(lines):
     errors = re.findall(r"crc=(\d+) stuff=(\d+)", text)
     mhz = re.findall(r"toggles [0-9.]+M +([0-9.]+)MHz", xlog.read_text())
     standby = "host:   serve off\ndevice: ok" in text
+    if lines != "idle" and not mhz:
+        say(f"{lines}: INVALID, Lab didn't drive the lines.  See {xlog}")
+        sys.exit(1)
     if failed_at:
         outcome = f"FAILED, nothing received from {failed_at}s"
     elif "no reply" in text or "disconnected" in text:
@@ -116,12 +128,14 @@ def run(lines):
         wait_replug()
 
 
-if not answers():
-    wait_replug()
-say(f"start {time.strftime('%H:%M:%S')}: {P / 'build/plugin_user.bin'}, image fill_00")
+# A stopped One ROM has no serial port, so look for it with onerom scan.
+while SERIAL not in subprocess.run(["onerom", "scan"], capture_output=True, text=True).stdout:
+    print(f"Waiting for One ROM {SERIAL} on USB", flush=True)
+    time.sleep(2)
+say(f"start {time.strftime('%H:%M:%S')}: {P / 'build/plugin_user.bin'}, {CHIP} all 0x00")
 r = subprocess.run(["onerom", "program", "--serial", SERIAL, "--plugin", "usb",
                     "--plugin", f"file={P / 'build/plugin_user.bin'}", "--slot",
-                    f"file={B / 'images/fill_00.rom'},type=27256", "--yes"],
+                    f"file={image},type={CHIP}", "--yes"],
                    capture_output=True, text=True)
 if r.returncode != 0:
     say(f"PROGRAMMING FAILED: {r.stdout[-300:]} {r.stderr[-300:]}")
