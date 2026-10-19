@@ -12,12 +12,16 @@
 //
 //   0   u32  FRAME_MAGIC
 //   4   u16  frame size in bytes, including this header and the CRC
-//   6   u16  reserved, 0
+//   6   u16  FRAME_LAYOUT
 //   8   u32  sequence number
 //   12  u32  plugin uptime, ms
 //   16  u32  writes that failed because channel 0 was full, since start
-//   20  ...  payload, xorshift32 words seeded from the sequence number
+//   20  u32  USB CRC errors, since start
+//   24  u32  USB bit-stuff errors, since start
+//   28  ...  payload, xorshift32 words seeded from the sequence number
 //   n-4 u32  CRC-32 (IEEE, as zlib) of bytes 0 to n-5
+//
+// Plugin v0.1.0 frames have 0 at offset 6 and the payload from offset 20.
 //
 // A frame is retried until there is room for it in channel 0.  A gap in
 // sequence numbers at the host is a frame lost after channel 0.
@@ -26,7 +30,7 @@
 
 #define VERSION_MAJOR 0u
 #define VERSION_MINOR 1u
-#define VERSION_PATCH 0u
+#define VERSION_PATCH 1u
 
 #if defined(DATA_DRIVE_MA)
 void drive_main(ora_lookup_fn_t, ora_plugin_type_t, const ora_entry_args_t *);
@@ -42,7 +46,8 @@ ORA_DEFINE_USER_PLUGIN(
 );
 
 #define FRAME_MAGIC         0x3CC3A55Au
-#define FRAME_HEADER_SIZE   20u
+#define FRAME_LAYOUT        1u
+#define FRAME_HEADER_SIZE   28u
 #define FRAME_MIN_SIZE      32u
 #define FRAME_MAX_SIZE      256u
 #define FRAME_DEFAULT_SIZE  64u
@@ -55,6 +60,14 @@ ORA_DEFINE_USER_PLUGIN(
 // 32 bits.
 #define RATE_MAX            2000000u
 #define CREDIT_MAX_MS       100u
+
+// The USB controller's SIE_STATUS register and its atomic clear alias.  TinyUSB
+// in the USB plugin doesn't use the two error flags, so clearing them here
+// doesn't affect it.
+#define USB_SIE_STATUS      ((volatile uint32_t *)0x50110050u)
+#define USB_SIE_STATUS_CLR  ((volatile uint32_t *)0x50113050u)
+#define SIE_CRC_ERROR       (1u << 24)
+#define SIE_BIT_STUFF_ERROR (1u << 25)
 
 typedef struct {
     ora_yield_fn_t                yield;
@@ -71,6 +84,8 @@ typedef struct {
 
     uint32_t seq;
     uint32_t full;
+    uint32_t crc_errors;
+    uint32_t stuff_errors;
     uint32_t start_ms;
     uint32_t stop_ms;
     uint32_t last_ms;
@@ -171,6 +186,10 @@ static void print_status(void) {
     out_u32(s.full);
     out_str(" ms=");
     out_u32(end - s.start_ms);
+    out_str(" crc=");
+    out_u32(s.crc_errors);
+    out_str(" stuff=");
+    out_u32(s.stuff_errors);
     out_end();
 }
 
@@ -193,10 +212,12 @@ static void build_frame(void) {
     uint32_t words = s.size / 4u;
 
     frame[0] = FRAME_MAGIC;
-    frame[1] = s.size;
+    frame[1] = s.size | (FRAME_LAYOUT << 16);
     frame[2] = s.seq;
     frame[3] = s.uptime();
     frame[4] = s.full;
+    frame[5] = s.crc_errors;
+    frame[6] = s.stuff_errors;
 
     // xorshift32 started at 0 stays at 0.
     uint32_t x = s.seq ^ 0x9E3779B9u;
@@ -291,6 +312,8 @@ static void reply_err(const char *msg) {
 static void cmd_start(void) {
     s.seq = 0u;
     s.full = 0u;
+    s.crc_errors = 0u;
+    s.stuff_errors = 0u;
     s.credit = 0u;
     s.start_ms = s.uptime();
     s.last_ms = s.start_ms;
@@ -449,6 +472,21 @@ static void input_task(void) {
     }
 }
 
+// Several errors between two checks count as one, so a count is a lower bound.
+static void error_task(void) {
+    uint32_t flags = *USB_SIE_STATUS & (SIE_CRC_ERROR | SIE_BIT_STUFF_ERROR);
+    if (flags == 0u) {
+        return;
+    }
+    if (flags & SIE_CRC_ERROR) {
+        s.crc_errors++;
+    }
+    if (flags & SIE_BIT_STUFF_ERROR) {
+        s.stuff_errors++;
+    }
+    *USB_SIE_STATUS_CLR = flags;
+}
+
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
@@ -508,6 +546,7 @@ void plugin_main(
 
     for (;;) {
         (void)s.yield(NULL);
+        error_task();
         input_task();
         if (s.streaming) {
             stream_task();

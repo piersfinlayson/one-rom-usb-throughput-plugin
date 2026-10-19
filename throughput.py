@@ -6,8 +6,9 @@
 """Host side of the One ROM USB throughput test.
 
 Starts the plugin's stream and checks each frame's sequence number and CRC.
-Prints rates and counts each second, then totals at the end. Exits 1 if a frame
-was lost or bad or the port disconnected.
+Prints rates and counts each second, then totals at the end. If the One ROM
+stops replying, waits for a replug or port reset to read its final counts.
+Exits 1 if a frame was lost or bad or the port disconnected.
 """
 
 import argparse
@@ -24,19 +25,24 @@ ONEROM_PID = 0xF542
 
 MAGIC = struct.pack("<I", 0x3CC3A55A)
 HEADER = struct.Struct("<IHHIII")
+USB_ERRORS = struct.Struct("<II")
 FRAME_MIN_SIZE = 32
 FRAME_MAX_SIZE = 256
 
 
+def onerom_ports(serial_number):
+    return [p for p in serial.tools.list_ports.comports()
+            if p.vid == ONEROM_VID and p.pid == ONEROM_PID
+            and serial_number in (None, p.serial_number)]
+
+
 def find_port(serial_number):
-    ports = [p.device for p in serial.tools.list_ports.comports()
-             if p.vid == ONEROM_VID and p.pid == ONEROM_PID
-             and serial_number in (None, p.serial_number)]
+    ports = onerom_ports(serial_number)
     if not ports:
         sys.exit("Couldn't find a One ROM serial port.")
     if len(ports) > 1:
         sys.exit(f"Found {len(ports)} One ROM serial ports. Use --serial or --port.")
-    return ports[0]
+    return ports[0].device, ports[0].serial_number
 
 
 class Stats:
@@ -50,6 +56,8 @@ class Stats:
         self.next_seq = None
         self.last_uptime = None
         self.last_full = 0
+        self.last_crc = None
+        self.last_stuff = None
 
 
 class Parser:
@@ -94,7 +102,7 @@ class Parser:
         if len(self.buf) < HEADER.size:
             return False
 
-        _, size, _, seq, uptime, full = HEADER.unpack_from(self.buf)
+        _, size, layout, seq, uptime, full = HEADER.unpack_from(self.buf)
         if size < FRAME_MIN_SIZE or size > FRAME_MAX_SIZE or size % 4:
             self._bad()
             return True
@@ -114,6 +122,8 @@ class Parser:
         s.frame_bytes += size
         s.last_uptime = uptime
         s.last_full = full
+        if layout >= 1:
+            s.last_crc, s.last_stuff = USB_ERRORS.unpack_from(self.buf, HEADER.size)
         del self.buf[:size]
         return True
 
@@ -148,8 +158,8 @@ def main():
     ap.add_argument("--raw", help="file to save every received byte to")
     args = ap.parse_args()
 
-    port = args.port or find_port(args.serial)
-    ser = serial.Serial(port, timeout=0.05)
+    port, serial_number = (args.port, None) if args.port else find_port(args.serial)
+    ser = serial.Serial(port, timeout=0.05, write_timeout=1)
     raw = open(args.raw, "wb") if args.raw else None
 
     stats = Stats()
@@ -203,6 +213,8 @@ def main():
                 if up0 is not None and stats.last_uptime != up0:
                     dev_ms = stats.last_uptime - up0
                     dev = f" full/s={(stats.last_full - full0) * 1000 // max(1, dev_ms)}"
+                if stats.last_crc is not None:
+                    dev += f" crc={stats.last_crc} stuff={stats.last_stuff}"
                 print(f"{now - start:7.1f}s"
                       f" rx={(stats.rx_bytes - rx0) / dt / 1024:7.1f}KB/s"
                       f" frames={(stats.frame_bytes - fb0) / dt / 1024:7.1f}KB/s"
@@ -225,7 +237,33 @@ def main():
         except serial.SerialException as e:
             reason = f"disconnected: {e}"
 
+    if not status and reason == "stopped":
+        reason = "no reply"
     print(f"\n{reason} after {elapsed:.1f}s")
+    if not status:
+        print("The One ROM isn't replying. Replug its USB or reset its port to read"
+              " its counts, or press Ctrl-C.", flush=True)
+        # Frames sent after the reconnection don't count.
+        parser = Parser(Stats(), on_line)
+        try:
+            while not status:
+                time.sleep(1)
+                ser.close()
+                ports = [p.device for p in onerom_ports(serial_number)
+                         if serial_number or p.device == port]
+                if not ports:
+                    continue
+                try:
+                    ser = serial.Serial(ports[0], timeout=0.05, write_timeout=1)
+                    pump(0.5)
+                    send("stop")
+                    deadline = time.monotonic() + 3
+                    while not status and time.monotonic() < deadline:
+                        pump(0.1)
+                except serial.SerialException:
+                    pass
+        except KeyboardInterrupt:
+            pass
     print(f"frames={stats.frames} bytes={stats.frame_bytes}"
           f" average={stats.frame_bytes / max(elapsed, 1e-9) / 1024:.1f}KB/s"
           f" lost={stats.lost} bad={stats.bad} junk={stats.junk}")
@@ -235,6 +273,9 @@ def main():
         print(f"device sent {sent} frames, host received {stats.frames}"
               f" and counted {stats.lost} lost, {sent - stats.frames - stats.lost}"
               " unaccounted for")
+        if "crc" in fields:
+            print(f"device counted {fields['crc']} USB CRC errors and"
+                  f" {fields['stuff']} bit-stuff errors")
     if raw:
         raw.close()
     return 0 if reason == "stopped" and not (stats.lost or stats.bad) else 1

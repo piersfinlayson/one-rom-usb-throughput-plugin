@@ -68,6 +68,8 @@ One line is printed per second:
 - `bad` - frames that failed the CRC or had an invalid size
 - `junk` - bytes that are neither frames nor text
 - `full/s` - writes per second that failed because channel 0 was full
+- `crc` - USB CRC errors counted by the plugin
+- `stuff` - USB bit-stuff errors counted by the plugin
 
 A more complex example:
 
@@ -95,7 +97,11 @@ Lab instance while Lab reads it continuously using its `x` command.
 - `dtest.sh <drive>-<slew>` - programs `build/drive-<drive>-<slew>/plugin_user.bin`
   and `images/alt_00_f8.rom`, then streams for 60s.
 - `gate.sh <plugin> <label>` - programs `<plugin>` and `images/fill_00.rom`.
-  Passes if the stream reaches 840 KB/s with Lab idle and under Lab reads.
+  Passes if the stream reaches 810 KB/s with Lab idle and under Lab reads.
+- `drive.py <label> <set>...` - programs `build/plugin_user.bin` and
+  `images/fill_00.rom`, then for each set streams for 60s with the One ROM in
+  standby while Lab drives data lines with the `d` command. A set is `idle` or
+  `<mask>:<delay>`, for example `f8:0`.
 
 The environment variables `C` and `LAB` set the One ROM's serial number and
 Lab's serial port:
