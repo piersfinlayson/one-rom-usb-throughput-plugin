@@ -24,7 +24,8 @@ onerom program --plugin usb \
 make
 ```
 
-Builds `build/plugin_user.bin`.
+Builds `build/plugin_user.bin`, then runs `check_loop.py`, which requires
+Python 3.
 
 ## Programming
 
@@ -50,7 +51,7 @@ Options:
 - `--seconds` - How long to run. 0, the default, runs until Ctrl-C.
 - `--rate` - Stream rate in bytes per second. 0, the default, streams as fast
   as possible.
-- `--size` - Frame size in bytes, a multiple of 4 from 32 to 256. The default
+- `--size` - Frame size in bytes, a multiple of 4 from 40 to 256. The default
   is 64.
 - `--cmd` - A plugin command to send before the stream starts. May be repeated.
 - `--at` - A plugin command to send during the run, as `SECONDS:COMMAND`. May
@@ -70,6 +71,8 @@ One line is printed per second:
 - `full/s` - writes per second that failed because channel 0 was full
 - `crc` - USB CRC errors counted by the plugin
 - `stuff` - USB bit-stuff errors counted by the plugin
+- `flash` - flash reads completed by the `flash` command
+- `flash_bad` - flash reads with the wrong hash
 
 A more complex example:
 
@@ -81,6 +84,14 @@ python3 throughput.py --seconds 60 --cmd "led cycle" --at "20:serve off" --at "4
 
 The plugin can be driven interactively using the USB serial port.  The
 supported commands are printed upon connection and by running `help`.
+
+## Flash Reads
+
+`flash <addr> <bytes> <hash>` reads a flash region through the uncached XIP
+alias whenever the plugin isn't sending a frame, so the flash bus is busy while
+the stream runs. Each read of the region is hashed and compared with `<hash>`,
+the FNV-1a hash of the region's 32-bit little-endian words.  `flash off` stops
+the reads.
 
 ## Frame Layout
 
@@ -112,6 +123,23 @@ C=952FFC01836FBD89 LAB=/dev/cu.usbmodem1203 bench/drun.sh test
 ```
 
 Output files are written to `bench/results/`.
+
+## Flash Tests
+
+The scripts in `bench/` also test a One ROM with a second flash chip:
+
+- `flash.py <label> <set>...` - programs `build/plugin_user.bin` and six 512KB
+  slots, then for each set streams for 60s while the plugin reads a slot. A set
+  is `idle`, `cs0-rand`, `cs1-rand`, `cs1-00` or `cs1-ff`, optionally followed
+  by `@<bytes/s>`, then by `+r` for Lab to read the One ROM or `+d` for Lab to
+  drive its data lines.
+- `peek.sh <label> <image> <count>` - reads the second chip's slots `<count>`
+  times with `onerom inspect peek memory` and compares them with `<image>`, the
+  `image.bin` written by `flash.py`.
+
+`C` sets the One ROM's serial number. For `flash.py`, `BOARD` sets the board,
+`LAB` Lab's serial port, `CPU` the clock, for example `266MHz`, and `SECONDS`
+the run length.
 
 ## Other
 

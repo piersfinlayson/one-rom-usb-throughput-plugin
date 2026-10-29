@@ -26,6 +26,7 @@ ONEROM_PID = 0xF542
 MAGIC = struct.pack("<I", 0x3CC3A55A)
 HEADER = struct.Struct("<IHHIII")
 USB_ERRORS = struct.Struct("<II")
+FLASH_COUNTS = struct.Struct("<II")
 FRAME_MIN_SIZE = 32
 FRAME_MAX_SIZE = 256
 
@@ -58,6 +59,7 @@ class Stats:
         self.last_full = 0
         self.last_crc = None
         self.last_stuff = None
+        self.last_flash = None
 
 
 class Parser:
@@ -124,6 +126,9 @@ class Parser:
         s.last_full = full
         if layout >= 1:
             s.last_crc, s.last_stuff = USB_ERRORS.unpack_from(self.buf, HEADER.size)
+        if layout >= 2:
+            s.last_flash = FLASH_COUNTS.unpack_from(
+                self.buf, HEADER.size + USB_ERRORS.size)
         del self.buf[:size]
         return True
 
@@ -215,6 +220,9 @@ def main():
                     dev = f" full/s={(stats.last_full - full0) * 1000 // max(1, dev_ms)}"
                 if stats.last_crc is not None:
                     dev += f" crc={stats.last_crc} stuff={stats.last_stuff}"
+                if stats.last_flash is not None:
+                    dev += (f" flash={stats.last_flash[0]}"
+                            f" flash_bad={stats.last_flash[1]}")
                 print(f"{now - start:7.1f}s"
                       f" rx={(stats.rx_bytes - rx0) / dt / 1024:7.1f}KB/s"
                       f" frames={(stats.frame_bytes - fb0) / dt / 1024:7.1f}KB/s"
@@ -267,8 +275,8 @@ def main():
     print(f"frames={stats.frames} bytes={stats.frame_bytes}"
           f" average={stats.frame_bytes / max(elapsed, 1e-9) / 1024:.1f}KB/s"
           f" lost={stats.lost} bad={stats.bad} junk={stats.junk}")
+    fields = dict(f.split("=") for f in status[0].split()[1:]) if status else {}
     if status:
-        fields = dict(f.split("=") for f in status[0].split()[1:])
         sent = int(fields["frames"])
         print(f"device sent {sent} frames, host received {stats.frames}"
               f" and counted {stats.lost} lost, {sent - stats.frames - stats.lost}"
@@ -276,9 +284,14 @@ def main():
         if "crc" in fields:
             print(f"device counted {fields['crc']} USB CRC errors and"
                   f" {fields['stuff']} bit-stuff errors")
+        if "flash_passes" in fields:
+            print(f"device read flash {fields['flash_passes']} times,"
+                  f" {fields['flash_bad']} with the wrong hash")
     if raw:
         raw.close()
-    return 0 if reason == "stopped" and not (stats.lost or stats.bad) else 1
+    flash_bad = int(fields.get("flash_bad", 0))
+    return 0 if reason == "stopped" and not (stats.lost or stats.bad
+                                             or flash_bad) else 1
 
 
 if __name__ == "__main__":

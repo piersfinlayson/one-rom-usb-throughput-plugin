@@ -14,23 +14,33 @@
 //   4   u16  frame size in bytes, including this header and the CRC
 //   6   u16  FRAME_LAYOUT
 //   8   u32  sequence number
-//   12  u32  plugin uptime, ms
+//   12  u32  plugin uptime when the frame was built, ms
 //   16  u32  writes that failed because channel 0 was full, since start
 //   20  u32  USB CRC errors, since start
 //   24  u32  USB bit-stuff errors, since start
-//   28  ...  payload, xorshift32 words seeded from the sequence number
+//   28  u32  flash passes, since start
+//   32  u32  flash passes with the wrong hash, since start
+//   36  ...  payload, xorshift32 words seeded from the sequence number
 //   n-4 u32  CRC-32 (IEEE, as zlib) of bytes 0 to n-5
 //
 // Plugin v0.1.0 frames have 0 at offset 6 and the payload from offset 20.
+// Plugin v0.1.1 frames have 1 at offset 6 and the payload from offset 28.
 //
-// A frame is retried until there is room for it in channel 0.  A gap in
+// A frame is built once and retried until there is room for it in channel 0,
+// so the counters in it are from when it was built.  A gap in
 // sequence numbers at the host is a frame lost after channel 0.
+//
+// The flash command reads a flash region through the uncached XIP alias
+// whenever a frame isn't sent, so the flash bus is busy while the stream runs
+// at full rate.  Each word is a separate QSPI transfer.  A pass hashes the
+// region with FNV-1a over 32-bit words and is counted bad if the hash differs
+// from the one provided by the host.
 
 #include "plugin.h"
 
 #define VERSION_MAJOR 0u
-#define VERSION_MINOR 1u
-#define VERSION_PATCH 1u
+#define VERSION_MINOR 2u
+#define VERSION_PATCH 0u
 
 #if defined(DATA_DRIVE_MA)
 void drive_main(ora_lookup_fn_t, ora_plugin_type_t, const ora_entry_args_t *);
@@ -46,13 +56,24 @@ ORA_DEFINE_USER_PLUGIN(
 );
 
 #define FRAME_MAGIC         0x3CC3A55Au
-#define FRAME_LAYOUT        1u
-#define FRAME_HEADER_SIZE   28u
-#define FRAME_MIN_SIZE      32u
+#define FRAME_LAYOUT        2u
+#define FRAME_HEADER_SIZE   36u
+#define FRAME_MIN_SIZE      40u
 #define FRAME_MAX_SIZE      256u
 #define FRAME_DEFAULT_SIZE  64u
 
-#define LINE_MAX            32u
+#define LINE_MAX            48u
+
+// Both chip select windows.  The uncached alias doesn't allocate in the cache.
+#define FLASH_START         0x10000000u
+#define FLASH_END           0x12000000u
+#define XIP_NOCACHE_OFFSET  0x04000000u
+#define FLASH_BURST_WORDS   64u
+#define FNV_BASIS           0x811C9DC5u
+#define FNV_PRIME           0x01000193u
+
+// A frame is retried from RAM this many times before the loop reads commands.
+#define SEND_TRIES          1000u
 
 
 // Credit is in byte-milliseconds so the rate is applied without a division.
@@ -76,6 +97,7 @@ typedef struct {
     ora_get_plugin_uptime_ms_fn_t uptime;
     ora_led_set_fn_t              led_set;
     ora_set_standby_fn_t          set_standby;
+    void                          (*flash_task)(void);
 
 
     uint8_t  streaming;
@@ -90,20 +112,50 @@ typedef struct {
     uint32_t stop_ms;
     uint32_t last_ms;
     uint32_t credit;
+    uint8_t  frame_built;
+
+    uint8_t  flash;
+    const volatile uint32_t *flash_addr;
+    uint32_t flash_words;
+    uint32_t flash_hash_expected;
+    uint32_t flash_pos;
+    uint32_t flash_hash;
+    uint32_t flash_passes;
+    uint32_t flash_bad;
 
     uint32_t line_len;
     char     line[LINE_MAX];
 } state_t;
 
 static state_t s;
-static uint32_t frame[FRAME_MAX_SIZE / 4u];
 
 static const char channel_name[] = "usb-throughput";
 
-static void init_bss(void) {
+// The stream rate must not depend on where the loop's code is in flash.  Code
+// run from flash shares the XIP cache with the USB plugin's code, so moving the
+// loop by a few bytes could change the stream rate by 15%.  The loop runs
+// through the uncached XIP alias, where its fetches don't take cache lines,
+// and the work it repeats for every frame runs from RAM, where it isn't slowed
+// by uncached fetches.
+//
+// Calls from the loop must be PC-relative to stay in the uncached alias.
+// check_loop.py fails the build where code other than plugin_main refers to a
+// flash code address.
+// Calls between flash and RAM are out of range of a PC-relative call.
+#define RAMFUNC __attribute__((section(".ramfunc"), noinline, long_call))
+
+static void init_ram(void) {
+    extern uint32_t __ramfunc_start;
+    extern uint32_t __ramfunc_end;
+    extern uint32_t __ramfunc_load;
     extern uint32_t __bss_start;
     extern uint32_t __bss_end;
-    volatile uint32_t *dst = &__bss_start;
+    const volatile uint32_t *src = &__ramfunc_load;
+    volatile uint32_t *dst = &__ramfunc_start;
+    while (dst < &__ramfunc_end) {
+        *dst++ = *src++;
+    }
+    dst = &__bss_start;
     while (dst < &__bss_end) {
         *dst++ = 0u;
     }
@@ -159,10 +211,13 @@ static const char *const menu[] = {
     "  status                settings and counters",
     "  start                 start streaming frames",
     "  stop                  stop streaming",
-    "  size <bytes>          frame size, 32 to 256, a multiple of 4",
+    "  size <bytes>          frame size, 40 to 256, a multiple of 4",
     "  rate <bytes/s>        stream rate, 0 for as fast as possible",
     "  led <mode>            RGB LED: off on flame cycle breathe blink",
     "  serve <on|off>        ROM serving",
+    "  flash <addr> <bytes> <hash>",
+    "                        read flash, checking each pass's hash",
+    "  flash off             stop reading flash",
 };
 
 static void print_menu(void) {
@@ -190,6 +245,10 @@ static void print_status(void) {
     out_u32(s.crc_errors);
     out_str(" stuff=");
     out_u32(s.stuff_errors);
+    out_str(" flash_passes=");
+    out_u32(s.flash_passes);
+    out_str(" flash_bad=");
+    out_u32(s.flash_bad);
     out_end();
 }
 
@@ -197,7 +256,9 @@ static void print_status(void) {
 // Frames
 // ---------------------------------------------------------------------------
 
-static uint32_t crc32(const uint8_t *p, uint32_t len) {
+// Inlined into build_frame, which runs from RAM.
+static inline __attribute__((always_inline))
+uint32_t crc32(const uint8_t *p, uint32_t len) {
     uint32_t crc = 0xFFFFFFFFu;
     for (uint32_t i = 0u; i < len; i++) {
         crc ^= p[i];
@@ -208,7 +269,7 @@ static uint32_t crc32(const uint8_t *p, uint32_t len) {
     return ~crc;
 }
 
-static void build_frame(void) {
+RAMFUNC static void build_frame(uint32_t *frame) {
     uint32_t words = s.size / 4u;
 
     frame[0] = FRAME_MAGIC;
@@ -218,6 +279,8 @@ static void build_frame(void) {
     frame[4] = s.full;
     frame[5] = s.crc_errors;
     frame[6] = s.stuff_errors;
+    frame[7] = s.flash_passes;
+    frame[8] = s.flash_bad;
 
     // xorshift32 started at 0 stays at 0.
     uint32_t x = s.seq ^ 0x9E3779B9u;
@@ -234,8 +297,24 @@ static void build_frame(void) {
     frame[words - 1u] = crc32((const uint8_t *)frame, s.size - 4u);
 }
 
-// Sends at most one frame so commands are read between frames.
-static void stream_task(void) {
+// Returns 1 if the frame was sent, or 0 if the channel was full for every try.
+RAMFUNC static uint8_t send_frame(const uint32_t *frame) {
+    for (uint32_t i = 0u; i < SEND_TRIES; i++) {
+        if (s.write(ORA_LOG_CHANNEL_0, frame, s.size) != ORA_RESULT_LOG_FULL) {
+            return 1u;
+        }
+        s.full++;
+        (void)s.yield(NULL);
+        if (s.flash) {
+            s.flash_task();
+        }
+    }
+    return 0u;
+}
+
+// Sends at most one frame so commands are read between frames.  Returns 1 if
+// it sent one.
+static uint8_t stream_task(uint32_t *frame) {
     if (s.rate != 0u) {
         uint32_t now = s.uptime();
         uint32_t elapsed = now - s.last_ms;
@@ -252,20 +331,57 @@ static void stream_task(void) {
             s.credit = cap;
         }
         if (s.credit < s.size * 1000u) {
-            return;
+            return 0u;
         }
     }
 
-    build_frame();
-    if (s.write(ORA_LOG_CHANNEL_0, frame, s.size) == ORA_RESULT_LOG_FULL) {
-        s.full++;
-        return;
+    if (!s.frame_built) {
+        build_frame(frame);
+        s.frame_built = 1u;
+    }
+    if (!send_frame(frame)) {
+        return 0u;
     }
 
+    s.frame_built = 0u;
     s.seq++;
     if (s.rate != 0u) {
         s.credit -= s.size * 1000u;
     }
+    return 1u;
+}
+
+// ---------------------------------------------------------------------------
+// Flash
+// ---------------------------------------------------------------------------
+
+static void flash_restart(void) {
+    s.flash_pos = 0u;
+    s.flash_hash = FNV_BASIS;
+    s.flash_passes = 0u;
+    s.flash_bad = 0u;
+}
+
+static void flash_task(void) {
+    uint32_t pos = s.flash_pos;
+    uint32_t hash = s.flash_hash;
+    uint32_t end = pos + FLASH_BURST_WORDS;
+    if (end > s.flash_words) {
+        end = s.flash_words;
+    }
+    for (; pos < end; pos++) {
+        hash = (hash ^ s.flash_addr[pos]) * FNV_PRIME;
+    }
+    if (pos == s.flash_words) {
+        s.flash_passes++;
+        if (hash != s.flash_hash_expected) {
+            s.flash_bad++;
+        }
+        pos = 0u;
+        hash = FNV_BASIS;
+    }
+    s.flash_pos = pos;
+    s.flash_hash = hash;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,24 +396,53 @@ static uint8_t str_eq(const char *a, const char *b) {
     return *a == *b;
 }
 
-// Returns 0 if str isn't a decimal number that fits in 32 bits.
+// Returns 0 if str isn't a decimal or 0x-prefixed hex number that fits in 32
+// bits.
 static uint8_t parse_u32(const char *str, uint32_t *out) {
+    uint32_t base = 10u;
     uint32_t v = 0u;
+    if ((str[0] == '0') && (str[1] == 'x')) {
+        base = 16u;
+        str += 2;
+    }
     if (*str == '\0') {
         return 0u;
     }
     for (; *str != '\0'; str++) {
-        if ((*str < '0') || (*str > '9')) {
+        uint32_t d;
+        if ((*str >= '0') && (*str <= '9')) {
+            d = (uint32_t)(*str - '0');
+        } else if ((base == 16u) && (*str >= 'a') && (*str <= 'f')) {
+            d = (uint32_t)(*str - 'a') + 10u;
+        } else if ((base == 16u) && (*str >= 'A') && (*str <= 'F')) {
+            d = (uint32_t)(*str - 'A') + 10u;
+        } else {
             return 0u;
         }
-        uint32_t d = (uint32_t)(*str - '0');
-        if (v > (0xFFFFFFFFu - d) / 10u) {
+        if (v > (0xFFFFFFFFu - d) / base) {
             return 0u;
         }
-        v = (v * 10u) + d;
+        v = (v * base) + d;
     }
     *out = v;
     return 1u;
+}
+
+// Splits off the first space-separated word of *str and returns it.
+static char *next_word(char **str) {
+    char *word = *str;
+    char *p = word;
+    while ((*p != '\0') && (*p != ' ')) {
+        p++;
+    }
+    if (*p == ' ') {
+        *p++ = '\0';
+        while (*p == ' ') {
+            p++;
+        }
+    }
+    *str = p;
+    return word;
 }
 
 static void reply_ok(void) {
@@ -311,9 +456,11 @@ static void reply_err(const char *msg) {
 
 static void cmd_start(void) {
     s.seq = 0u;
+    s.frame_built = 0u;
     s.full = 0u;
     s.crc_errors = 0u;
     s.stuff_errors = 0u;
+    flash_restart();
     s.credit = 0u;
     s.start_ms = s.uptime();
     s.last_ms = s.start_ms;
@@ -338,6 +485,7 @@ static void cmd_size(const char *arg) {
         return;
     }
     s.size = v;
+    s.frame_built = 0u;
     reply_ok();
 }
 
@@ -411,17 +559,34 @@ static void cmd_serve(const char *arg) {
     reply_ok();
 }
 
+static void cmd_flash(char *arg) {
+    if (str_eq(arg, "off")) {
+        s.flash = 0u;
+        reply_ok();
+        return;
+    }
+    uint32_t addr, bytes, hash;
+    if (!parse_u32(next_word(&arg), &addr) ||
+        !parse_u32(next_word(&arg), &bytes) ||
+        !parse_u32(next_word(&arg), &hash) || (*arg != '\0') ||
+        (addr < FLASH_START) || (addr >= FLASH_END) || ((addr % 4u) != 0u) ||
+        (bytes == 0u) || ((bytes % 4u) != 0u) ||
+        (bytes > FLASH_END - addr)) {
+        reply_err("flash is off, or <addr> <bytes> <hash> within 0x10000000 to"
+                  " 0x12000000, word aligned");
+        return;
+    }
+    s.flash_addr = (const volatile uint32_t *)(addr + XIP_NOCACHE_OFFSET);
+    s.flash_words = bytes / 4u;
+    s.flash_hash_expected = hash;
+    flash_restart();
+    s.flash = 1u;
+    reply_ok();
+}
+
 static void run_command(char *line) {
     char *arg = line;
-    while ((*arg != '\0') && (*arg != ' ')) {
-        arg++;
-    }
-    if (*arg == ' ') {
-        *arg++ = '\0';
-        while (*arg == ' ') {
-            arg++;
-        }
-    }
+    line = next_word(&arg);
 
     if (line[0] == '\0') {
         return;
@@ -441,7 +606,8 @@ static void run_command(char *line) {
         cmd_led(arg);
     } else if (str_eq(line, "serve")) {
         cmd_serve(arg);
-
+    } else if (str_eq(line, "flash")) {
+        cmd_flash(arg);
     } else {
         reply_err("unknown command, type help");
     }
@@ -491,6 +657,24 @@ static void error_task(void) {
 // Entry
 // ---------------------------------------------------------------------------
 
+// The frame is on the stack, as static RAM is too small for both it and the RAM
+// functions.
+__attribute__((noinline)) static void stream_loop(void) {
+    uint32_t frame[FRAME_MAX_SIZE / 4u];
+    for (;;) {
+        (void)s.yield(NULL);
+        error_task();
+        input_task();
+        uint8_t sent = 0u;
+        if (s.streaming) {
+            sent = stream_task(frame);
+        }
+        if (s.flash && !sent) {
+            s.flash_task();
+        }
+    }
+}
+
 static void park(void) {
     for (;;) {
         if (s.yield != NULL) {
@@ -507,7 +691,7 @@ void plugin_main(
     (void)plugin_type;
     (void)entry_args;
 
-    init_bss();
+    init_ram();
 
     s.yield       = ora_lookup_fn(ORA_ID_YIELD);
     s.write       = ora_lookup_fn(ORA_ID_LOG_WRITE);
@@ -544,18 +728,15 @@ void plugin_main(
     s.size = FRAME_DEFAULT_SIZE;
     print_menu();
 
-    for (;;) {
-        (void)s.yield(NULL);
-        error_task();
-        input_task();
-        if (s.streaming) {
-            stream_task();
-        }
-    }
+    // RAM can't hold flash_task as well, and uncached it reads flash at a sixth
+    // of the rate, so it runs through the cache.  The stream rate while it runs
+    // depends on where its code is.
+    s.flash_task = flash_task;
+    void (*loop)(void) =
+        (void (*)(void))((uintptr_t)stream_loop + XIP_NOCACHE_OFFSET);
+    loop();
 }
 
-// Follows plugin_main in flash so the streaming loop is at the same address as
-// in the default build.  The stream rate depends on that address.
 #if defined(DATA_DRIVE_MA)
 #if DATA_DRIVE_MA == 2
 #define DATA_DRIVE_FIELD 0u

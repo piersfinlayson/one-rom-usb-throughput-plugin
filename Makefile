@@ -34,10 +34,16 @@ else
 ORA := $(FETCHED_ORA)
 endif
 
+# check_loop.py reads the relocations kept by --emit-relocs.  The RAM functions
+# are loaded from flash, which puts a writable and executable segment in the
+# ELF.
+LINK_FLAGS := -Wl,--emit-relocs -Wl,--no-warn-rwx-segments
+OUT_DIR := build
+
 ifneq ($(DRIVE),)
 SLEW ?= fast
 DRIVE_FLAGS := -DDATA_DRIVE_MA=$(DRIVE) -DDATA_SLEW_FAST=$(if $(filter fast,$(SLEW)),1,0)
-DRIVE_BUILD := BUILD_DIR=build/drive-$(DRIVE)-$(SLEW)
+OUT_DIR := build/drive-$(DRIVE)-$(SLEW)
 endif
 
 .PHONY: all one-rom clean distclean
@@ -48,8 +54,10 @@ all: $(ORA)/plugin.mk
 		SRC=plugin_main.c \
 		ORA_INCLUDE=$(ORA) \
 		PLUGIN_TYPE=USER \
-		$(if $(DRIVE),EXTRA_C_FLAGS="$(DRIVE_FLAGS)" $(DRIVE_BUILD),) \
+		EXTRA_C_FLAGS="$(LINK_FLAGS) $(DRIVE_FLAGS)" \
+		BUILD_DIR=$(OUT_DIR) \
 		$(if $(TOOLCHAIN),TOOLCHAIN=$(TOOLCHAIN),)
+	@python3 check_loop.py $(OUT_DIR)/plugin_user.elf
 
 one-rom: $(FETCHED_ORA)/plugin.mk
 
